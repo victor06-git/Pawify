@@ -5,6 +5,9 @@ import time
 from pathlib import Path
 
 
+MCF_FREE_WALK_API_ID = 2045
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -33,7 +36,10 @@ def prepare_locomotion(conn, args: argparse.Namespace) -> None:
     time.sleep(args.stand_settle)
 
     if args.control_api == "velocity":
-        require_robot_step("free walk", conn.free_walk)
+        require_robot_step(
+            f"free walk (API {MCF_FREE_WALK_API_ID})",
+            lambda: conn.sport_command(MCF_FREE_WALK_API_ID),
+        )
         time.sleep(args.free_walk_settle)
         return
 
