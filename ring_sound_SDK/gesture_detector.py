@@ -10,6 +10,21 @@ from pathlib import Path
 
 FEATURES = ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]
 
+DEFAULT_CLASSIFY_OPTIONS = {
+    "top": 5,
+    "no_auto_segment": False,
+    "min_confidence": 0.08,
+    "non_sos_min_confidence": 0.015,
+    "max_distance": 1.45,
+    "vote_k": 3,
+    "sos_min_votes": 2,
+    "idle_gyro_rms": 1800.0,
+    "idle_gyro_peak": 7000.0,
+    "sos_min_gyro_rms": 5000.0,
+    "sos_min_gyro_peak": 10000.0,
+    "specific_non_sos": False,
+}
+
 
 def read_imu_csv(path: Path) -> list[dict[str, float]]:
     with path.open(newline="", encoding="utf-8") as file:
@@ -150,6 +165,111 @@ def distance(left: list[list[float]], right: list[list[float]]) -> float:
     return math.sqrt(total / max(1, count))
 
 
+def classify_file(
+    input_path: Path,
+    model_path: Path,
+    **overrides: float | int | bool,
+) -> dict[str, object]:
+    options = {**DEFAULT_CLASSIFY_OPTIONS, **overrides}
+    model = json.loads(model_path.read_text(encoding="utf-8"))
+    stats = motion_stats(input_path)
+    sequence = prepare_sequence(
+        input_path,
+        int(model["points"]),
+        bool(model.get("auto_segment", True)) and not bool(options["no_auto_segment"]),
+    )
+
+    scored = []
+    for template in model["templates"]:
+        scored.append(
+            (
+                distance(sequence, template["sequence"]),
+                template["gesture"],
+                template["source"],
+            )
+        )
+    scored.sort(key=lambda item: item[0])
+    best_distance, best_gesture, best_source = scored[0]
+    runner_up = scored[1][0] if len(scored) > 1 else best_distance
+    confidence = 1.0 - best_distance / runner_up if runner_up > 0 else 1.0
+    vote_window = scored[: max(1, int(options["vote_k"]))]
+    vote_counts: dict[str, int] = {}
+    for _dist, gesture, _source in vote_window:
+        vote_counts[gesture] = vote_counts.get(gesture, 0) + 1
+
+    gestures = {template["gesture"] for template in model["templates"]}
+    decision = "unknown"
+    if (
+        "idle" in gestures
+        and stats["gyro_rms"] <= float(options["idle_gyro_rms"])
+        and stats["gyro_peak"] <= float(options["idle_gyro_peak"])
+    ):
+        decision = "idle"
+    elif (
+        vote_counts.get("sos_shake_hand", 0) > 0
+        and (
+            stats["gyro_rms"] < float(options["sos_min_gyro_rms"])
+            or stats["gyro_peak"] < float(options["sos_min_gyro_peak"])
+        )
+    ):
+        decision = "unknown"
+    elif (
+        vote_counts.get("sos_shake_hand", 0) >= int(options["sos_min_votes"])
+        and best_distance <= float(options["max_distance"])
+    ):
+        decision = "sos_shake_hand"
+    elif (
+        best_gesture != "sos_shake_hand"
+        and best_distance <= float(options["max_distance"])
+        and confidence >= float(options["non_sos_min_confidence"])
+    ):
+        if bool(options["specific_non_sos"]):
+            decision = best_gesture
+        else:
+            decision = "non_sos_motion"
+    elif best_distance <= float(options["max_distance"]) and confidence >= float(
+        options["min_confidence"]
+    ):
+        decision = best_gesture
+
+    return {
+        "decision": decision,
+        "nearest_gesture": best_gesture,
+        "distance": best_distance,
+        "confidence": confidence,
+        "votes": vote_counts,
+        "motion": stats,
+        "nearest_template": best_source,
+        "top_matches": scored[: int(options["top"])],
+    }
+
+
+def print_classification(result: dict[str, object]) -> None:
+    stats = result["motion"]
+    assert isinstance(stats, dict)
+    print(f"decision: {result['decision']}")
+    print(f"nearest_gesture: {result['nearest_gesture']}")
+    print(f"distance: {float(result['distance']):.4f}")
+    print(f"confidence: {float(result['confidence']):.2f}")
+    votes = result["votes"]
+    assert isinstance(votes, dict)
+    print(
+        "votes: "
+        + ", ".join(
+            f"{gesture}={count}" for gesture, count in sorted(votes.items())
+        )
+    )
+    print(
+        "motion: "
+        f"rows={int(float(stats['rows']))} duration={float(stats['duration_s']):.2f}s "
+        f"gyro_rms={float(stats['gyro_rms']):.1f} gyro_peak={float(stats['gyro_peak']):.1f}"
+    )
+    print(f"nearest_template: {result['nearest_template']}")
+    print("top matches:")
+    for dist, gesture, source in result["top_matches"]:
+        print(f"  {gesture:20s} {dist:.4f} {source}")
+
+
 def cmd_add_template(args: argparse.Namespace) -> None:
     label = sanitize_label(args.gesture)
     target_dir = args.dataset / label
@@ -189,86 +309,23 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 
 def cmd_classify(args: argparse.Namespace) -> None:
-    model = json.loads(args.model.read_text(encoding="utf-8"))
-    stats = motion_stats(args.input)
-    sequence = prepare_sequence(
+    result = classify_file(
         args.input,
-        int(model["points"]),
-        bool(model.get("auto_segment", True)) and not args.no_auto_segment,
+        args.model,
+        top=args.top,
+        no_auto_segment=args.no_auto_segment,
+        min_confidence=args.min_confidence,
+        non_sos_min_confidence=args.non_sos_min_confidence,
+        max_distance=args.max_distance,
+        vote_k=args.vote_k,
+        sos_min_votes=args.sos_min_votes,
+        idle_gyro_rms=args.idle_gyro_rms,
+        idle_gyro_peak=args.idle_gyro_peak,
+        sos_min_gyro_rms=args.sos_min_gyro_rms,
+        sos_min_gyro_peak=args.sos_min_gyro_peak,
+        specific_non_sos=args.specific_non_sos,
     )
-
-    scored = []
-    for template in model["templates"]:
-        scored.append(
-            (
-                distance(sequence, template["sequence"]),
-                template["gesture"],
-                template["source"],
-            )
-        )
-    scored.sort(key=lambda item: item[0])
-    best_distance, best_gesture, best_source = scored[0]
-    runner_up = scored[1][0] if len(scored) > 1 else best_distance
-    confidence = 1.0 - best_distance / runner_up if runner_up > 0 else 1.0
-    vote_window = scored[: max(1, args.vote_k)]
-    vote_counts: dict[str, int] = {}
-    for _dist, gesture, _source in vote_window:
-        vote_counts[gesture] = vote_counts.get(gesture, 0) + 1
-
-    gestures = {template["gesture"] for template in model["templates"]}
-    decision = "unknown"
-    if (
-        "idle" in gestures
-        and stats["gyro_rms"] <= args.idle_gyro_rms
-        and stats["gyro_peak"] <= args.idle_gyro_peak
-    ):
-        decision = "idle"
-    elif (
-        vote_counts.get("sos_shake_hand", 0) > 0
-        and (
-            stats["gyro_rms"] < args.sos_min_gyro_rms
-            or stats["gyro_peak"] < args.sos_min_gyro_peak
-        )
-    ):
-        decision = "unknown"
-    elif (
-        vote_counts.get("sos_shake_hand", 0) >= args.sos_min_votes
-        and best_distance <= args.max_distance
-    ):
-        decision = "sos_shake_hand"
-    elif (
-        best_gesture != "sos_shake_hand"
-        and best_distance <= args.max_distance
-        and confidence >= args.non_sos_min_confidence
-    ):
-        if args.specific_non_sos:
-            decision = best_gesture
-        else:
-            decision = "non_sos_motion"
-    elif best_distance <= args.max_distance and confidence >= args.min_confidence:
-        decision = best_gesture
-    else:
-        decision = "unknown"
-
-    print(f"decision: {decision}")
-    print(f"nearest_gesture: {best_gesture}")
-    print(f"distance: {best_distance:.4f}")
-    print(f"confidence: {confidence:.2f}")
-    print(
-        "votes: "
-        + ", ".join(
-            f"{gesture}={count}" for gesture, count in sorted(vote_counts.items())
-        )
-    )
-    print(
-        "motion: "
-        f"rows={int(stats['rows'])} duration={stats['duration_s']:.2f}s "
-        f"gyro_rms={stats['gyro_rms']:.1f} gyro_peak={stats['gyro_peak']:.1f}"
-    )
-    print(f"nearest_template: {best_source}")
-    print("top matches:")
-    for dist, gesture, source in scored[: args.top]:
-        print(f"  {gesture:20s} {dist:.4f} {source}")
+    print_classification(result)
 
 
 def cmd_segment(args: argparse.Namespace) -> None:
