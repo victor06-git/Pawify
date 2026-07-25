@@ -222,8 +222,8 @@ class SendGoalApp(ctk.CTk):
             command=self._cancel_navigation,
         ).pack(side="left", padx=(10, 0))
         ctk.CTkButton(
-            entry_row, text="📍", width=32, height=32, corner_radius=16,
-            fg_color="#2980b9", hover_color="#1f618d",
+            entry_row, text="📍", width=48, height=48, corner_radius=24,
+            font=ctk.CTkFont(size=20), fg_color="#2980b9", hover_color="#1f618d",
             command=self._fetch_nearest_gps,
         ).pack(side="left", padx=(10, 0))
 
@@ -278,6 +278,12 @@ class SendGoalApp(ctk.CTk):
 
     def _send_goal(self, x: float, y: float) -> None:
         from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+
+        # Keep the x/y entries in sync with whatever point this goal actually
+        # came from — a map click included. Without this, clicking the map
+        # published a goal at the clicked point while the entry boxes kept
+        # showing whatever (or nothing) was typed there before.
+        self._set_xy_entries(x, y)
 
         classification = self._map_view.classify(x, y)
         if classification == "out_of_bounds":
@@ -341,11 +347,17 @@ class SendGoalApp(ctk.CTk):
         coordinates by hand, so a stale/bad GPS fix can't move the robot
         without the operator hitting Send Goal."""
         self._map_view.update_goal(x, y)
+        self._set_xy_entries(x, y)
+        self._log(f"Nearest GPS position selected: x={x:.2f}m y={y:.2f}m — press Send Goal to confirm.")
+
+    def _set_xy_entries(self, x: float, y: float) -> None:
+        """Keeps the x/y entry boxes showing the same point as the last map
+        click, typed entry, or fetched GPS fix, so what's displayed always
+        matches what would actually be (or was) sent."""
         self._x_entry.delete(0, "end")
         self._x_entry.insert(0, f"{x:.2f}")
         self._y_entry.delete(0, "end")
         self._y_entry.insert(0, f"{y:.2f}")
-        self._log(f"Nearest GPS position selected: x={x:.2f}m y={y:.2f}m — press Send Goal to confirm.")
 
     def _cancel_navigation(self) -> None:
         from dimos.msgs.std_msgs.Bool import Bool

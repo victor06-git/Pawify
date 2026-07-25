@@ -1,5 +1,7 @@
 # DOG
 
+![Unitree Go2 air](images/dog_robot.png)
+
 Python tooling that turns a Unitree Go2 (running [dimOS](https://github.com/dimensionalOS/dimos)) into a
 rescue/operator platform: a full teleop + camera + talk console (`pawify.py`), a lightweight
 map/nav-goal sender (`send_goal.py`), and a small HTTP bridge for a phone app (`robot_api.py` +
@@ -72,13 +74,9 @@ Useful flags (full list: `python pawify.py --help`, extends `direct_go2_move.py`
 (default `unitree-go2-relocalization`), `--speed`, `--no-obstacle-avoidance`,
 `--openrouter-key <key>`.
 
-Once running, **Navigate mode is entered from inside Pawify's own UI** (the "Enter Navigate Mode"
-button) — it launches `dimos run unitree-go2-relocalization -o relocalizationmodule.map_file=<map>`
-as a subprocess for you. You don't need to start the blueprint by hand for this flow; that's only
-needed for the standalone flows below.
 
-> 📸 *Screenshot — Pawify console (camera view + controls):* `![Pawify camera view](images/pawify_camera.png)`
-> 📸 *Screenshot — Pawify Navigate mode (map view):* `![Pawify navigate mode](images/pawify_navigate.png)`
+![Pawify app](images/pawify.png)
+
 
 ### Map sender / Interactive map (`send_goal.py`)
 
@@ -94,7 +92,7 @@ topics).
     ```
 - Execution: `./send_goal.sh`
 
-> 📸 *Screenshot — send_goal.py map/goal UI:* `![send_goal UI](images/send_goal.png)`
+![send_goal UI](images/send_goal.png)
 
 ### DimOS relocalization blueprint (standalone)
 
@@ -110,7 +108,7 @@ want the blueprint up **without** Pawify's teleop UI in front of it (e.g. drivin
 `send_goal.py`, or debugging the blueprint on its own); Pawify launches/stops this same command
 itself when you toggle Navigate mode.
 
-> 📸 *Screenshot — DimOS blueprint terminal output:* `![DimOS blueprint running](images/dimos_blueprint.png)`
+![DimOS app](images/dimOS.png)
 
 ## PREREQUISITES
 
@@ -248,7 +246,7 @@ python demo_gesture.py --address <MAC> --go2-direct-on-sos --go2-ip <ROBOT_IP> -
 (or `--dimos-on-sos` to route the trigger through a running DimOS instance instead of a direct
 WebRTC move — see `--dimos-cmd`/`--dimos-dir`).
 
-> 📸 *Screenshot — `demo_gesture.py` live classification output:* `![gesture demo](images/ring_gesture_demo.png)`
+
 > 📸 *Screenshot — `demo.apk` companion app:* `![ring companion app](images/ring_apk.png)`
 
 ## PRERREQUISITES
