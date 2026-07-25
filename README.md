@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">PAWIFY</h1>
-<p align="center"><em>"As long as you shake your hand, you'll be safe."</em></p>
+<p align="center"><em>"If you can shake you are safe."</em></p>
 
 <p align="center">
   <img src="images/logo.png" width="180" alt="Pawify paw + medical cross logo">
