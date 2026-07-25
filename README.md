@@ -95,3 +95,27 @@ and exact run commands for every app above, start with
 
 Licensed under the Apache License 2.0 — see [`LICENSE`](LICENSE). `pawify/` is a separate git
 submodule (<https://github.com/itsleatch/pawify.git>) and may carry its own licensing.
+
+
+
+## Questions
+
+What did we make and who will use it?
+
+Why did you choose this topic?
+
+What is the robot doing specifically?
+
+What capabilities did you use (navigation/perception/memory/voice/LLM integration...) and what additional human intervention did you implement?
+
+Which parts are remotely controlled and which run automosly?
+
+Is your project commercially viable?
+
+Who will fund it?
+
+Who are the users?
+
+All the people, in some places or zones that 
+
+
