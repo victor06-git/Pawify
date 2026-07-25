@@ -1,4 +1,4 @@
-# DOG
+# DOG (UNITREE GO2)
 
 ![Unitree Go2 air](images/dog_robot.png)
 
