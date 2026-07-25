@@ -17,8 +17,11 @@ no camera/audio.
 """
 
 import argparse
+import math
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -39,6 +42,15 @@ VIDEO_W, VIDEO_H = 720, 405
 TALK_SAMPLE_RATE = 44100
 TALK_CHANNELS = 1
 MAX_TALK_SECONDS = 10  # keep push-to-talk clips short — upload is slow (chunked, ~0.1s/4KB)
+
+# Navigate mode: the Go2 only accepts one WebRTC peer at a time (Unitree
+# firmware rejects a second connection attempt outright), so Pawify's own
+# teleop connection and DimOS's relocalization/navigation blueprint can
+# never both hold the robot at once. Navigate mode closes Pawify's own
+# connection, runs the blueprint as a subprocess for as long as the operator
+# wants map/nav, then closes it and reconnects teleop.
+NAV_BLUEPRINT = "unitree-go2-relocalization"
+NAV_READY_TIMEOUT_S = 90.0  # blueprint spin-up (11 worker processes + WebRTC) is slow
 
 # Quick-trick launcher (paw button menu) + trimmed trick panel both draw from
 # this one safe list — dances/flips/recovery-stand are deliberately excluded
@@ -62,6 +74,10 @@ _MOVE_BUTTON_KEYS = {
     "turn_left": "a",
     "turn_right": "d",
 }
+
+
+def _yaw_from_quaternion(q) -> float:
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
 class TalkRecorder:
@@ -326,6 +342,246 @@ class ObstacleRadar:
                 pass
 
 
+class NavigateBlueprint:
+    """Runs the DimOS relocalization/navigation blueprint as a child process
+    and reports when it's up (by polling for the blueprint's own topics —
+    see PawifyApp's nav-mode subscriber) and when it exits.
+
+    Deliberately dumb about *what* the blueprint publishes — that's the
+    subscriber's job (PawifyApp reads costmap/pose off the pub/sub bus
+    directly once this is running). This class only owns the OS process.
+    """
+
+    POLL_INTERVAL_S = 1.0
+
+    def __init__(
+        self,
+        dimos_python: Path,
+        dimos_dir: Path,
+        blueprint: str,
+        ready_timeout: float = NAV_READY_TIMEOUT_S,
+    ) -> None:
+        self._dimos_python = dimos_python
+        self._dimos_dir = dimos_dir
+        self._blueprint = blueprint
+        self._ready_timeout = ready_timeout
+        self._proc: subprocess.Popen | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def _find_dimos_bin(self) -> Path:
+        candidate = self._dimos_python.parent / "dimos"
+        if candidate.exists():
+            return candidate
+        found = shutil.which("dimos")
+        if found:
+            return Path(found)
+        raise FileNotFoundError(
+            f"No 'dimos' CLI found next to {self._dimos_python} or on PATH — "
+            "is dimos_dir's venv the one Pawify itself is running under?"
+        )
+
+    def start(self, map_file: Path, is_ready, on_ready, on_exit, log=print) -> None:
+        """Non-blocking. `is_ready()` is polled (from a background watcher
+        thread) until it returns True, at which point `on_ready()` fires
+        exactly once, or until the process exits or `ready_timeout` elapses
+        (logged but not fatal — the operator can keep waiting or give up).
+        `on_exit(code)` fires exactly once when the process dies for any
+        reason (clean stop() or a crash)."""
+        dimos_bin = self._find_dimos_bin()
+        cmd = [
+            str(dimos_bin), "run", self._blueprint,
+            "-o", f"relocalizationmodule.map_file={map_file}",
+        ]
+        log(f"Navigate: launching {' '.join(cmd)}")
+        self._proc = subprocess.Popen(
+            cmd,
+            cwd=str(self._dimos_dir),
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        proc = self._proc
+
+        def _stream_output() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                log(f"  [dimos] {line.rstrip()}")
+
+        def _watch() -> None:
+            became_ready = False
+            deadline = time.monotonic() + self._ready_timeout
+            while True:
+                code = proc.poll()
+                if code is not None:
+                    on_exit(code)
+                    return
+                if not became_ready:
+                    if is_ready():
+                        became_ready = True
+                        log("Navigate: blueprint is up.")
+                        on_ready()
+                    elif time.monotonic() > deadline:
+                        log(
+                            f"Navigate: still not seeing blueprint data after "
+                            f"{self._ready_timeout:.0f}s — check the [dimos] log lines above "
+                            "for errors (bad map path, robot unreachable, etc). Still waiting."
+                        )
+                        deadline = time.monotonic() + self._ready_timeout
+                time.sleep(self.POLL_INTERVAL_S)
+
+        threading.Thread(target=_stream_output, daemon=True).start()
+        threading.Thread(target=_watch, daemon=True).start()
+
+    def stop(self, log=print, timeout: float = 15.0) -> None:
+        """Blocking. SIGTERM is DimOS's own documented clean-shutdown path
+        (dimos/core/daemon.py: install_signal_handlers -> coordinator.stop()
+        + registry cleanup + sys.exit(0)); SIGKILL is only a last resort."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        log("Navigate: stopping the DimOS blueprint...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log("Navigate: blueprint didn't stop cleanly, killing it.")
+            proc.kill()
+            proc.wait(timeout=5.0)
+
+
+class NavMapView(ctk.CTkFrame):
+    """Renders the running Navigate-mode blueprint's live costmap + robot
+    pose inside Pawify's own window — no DimOS web UI involved, this reads
+    the blueprint's pub/sub topics directly (see PawifyApp's nav-mode
+    subscriber) and draws them here. A click is converted from image pixels
+    to a world-frame (x, y) and handed to `on_click_goal`.
+
+    Occupancy values follow the standard OccupancyGrid convention (see
+    dimos/mapping/pointclouds/occupancy.py's cost table): 0 = free,
+    100 = impassable, -1 = unknown.
+    """
+
+    UNKNOWN_RGB = (60, 60, 60)
+    FREE_RGB = (25, 130, 60)
+    WALL_RGB = (170, 30, 30)
+    ROBOT_RGB = (0, 170, 255)
+    GOAL_RGB = (241, 196, 15)
+
+    def __init__(self, parent, *, width: int, height: int, on_click_goal, **kwargs) -> None:
+        super().__init__(parent, fg_color="transparent", **kwargs)
+        self._width = width
+        self._height = height
+        self._on_click_goal = on_click_goal
+
+        self._image_label = ctk.CTkLabel(self, text="Enter Navigate Mode to see the map.")
+        self._image_label.pack(padx=8, pady=(8, 4))
+        self._image_label.bind("<Button-1>", self._on_click)
+
+        self._pose_label = ctk.CTkLabel(
+            self, text="pose: --", font=ctk.CTkFont(size=12), text_color="#888888"
+        )
+        self._pose_label.pack(fill="x", padx=8, pady=(0, 8))
+
+        self._grid_info: tuple[float, float, float, int, int] | None = None
+        self._base_rgb: np.ndarray | None = None  # last colorized costmap, HxWx3 uint8
+        self._robot_xy: tuple[float, float] | None = None
+        self._robot_yaw: float = 0.0
+        self._goal_xy: tuple[float, float] | None = None
+        self._scale = 1  # rendered-image px per grid cell
+
+    def update_costmap(
+        self, resolution: float, origin_x: float, origin_y: float,
+        width: int, height: int, data: np.ndarray,
+    ) -> None:
+        """`data` is a (height, width) array, row 0 = the row at `origin_y`,
+        values -1 (unknown) or 0-100 (traversal cost, 100 = impassable)."""
+        rgb = np.empty((height, width, 3), dtype=np.uint8)
+        rgb[:] = self.UNKNOWN_RGB
+        known = data >= 0
+        t = np.clip(data[known].astype(np.float32) / 100.0, 0.0, 1.0)
+        free_arr = np.array(self.FREE_RGB, dtype=np.float32)
+        wall_arr = np.array(self.WALL_RGB, dtype=np.float32)
+        rgb[known] = (free_arr[None, :] * (1 - t[:, None]) + wall_arr[None, :] * t[:, None]).astype(
+            np.uint8
+        )
+        # Grid row 0 is the lowest-y (origin) row; image row 0 is the top,
+        # so flip vertically to draw with "up" = +y like the physical map.
+        self._base_rgb = np.flipud(rgb)
+        self._grid_info = (resolution, origin_x, origin_y, width, height)
+        self._scale = max(1, min(self._width // max(width, 1), self._height // max(height, 1)))
+        self._redraw()
+
+    def update_pose(self, x: float, y: float, yaw: float) -> None:
+        self._robot_xy = (x, y)
+        self._robot_yaw = yaw
+        self._pose_label.configure(text=f"pose: x={x:.2f}m y={y:.2f}m yaw={math.degrees(yaw):.0f}°")
+        self._redraw()
+
+    def update_goal(self, x: float, y: float) -> None:
+        self._goal_xy = (x, y)
+        self._redraw()
+
+    def clear(self) -> None:
+        self._grid_info = None
+        self._base_rgb = None
+        self._robot_xy = None
+        self._goal_xy = None
+        self._image_label.configure(image=None, text="Enter Navigate Mode to see the map.")
+        self._pose_label.configure(text="pose: --")
+
+    def _world_to_px(self, x: float, y: float) -> tuple[int, int] | None:
+        if self._grid_info is None:
+            return None
+        resolution, origin_x, origin_y, width, height = self._grid_info
+        col = int((x - origin_x) / resolution)
+        row = int((y - origin_y) / resolution)
+        if not (0 <= col < width and 0 <= row < height):
+            return None
+        return col * self._scale, (height - 1 - row) * self._scale
+
+    def _redraw(self) -> None:
+        if self._base_rgb is None:
+            return
+        img = PILImage.fromarray(self._base_rgb, mode="RGB")
+        if self._scale != 1:
+            img = img.resize((img.width * self._scale, img.height * self._scale), PILImage.NEAREST)
+        draw = PILImageDraw.Draw(img)
+        if self._robot_xy is not None:
+            p = self._world_to_px(*self._robot_xy)
+            if p is not None:
+                r = max(3, self._scale)
+                draw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=self.ROBOT_RGB)
+                hx = p[0] + int(r * 2 * math.cos(-self._robot_yaw))
+                hy = p[1] + int(r * 2 * math.sin(-self._robot_yaw))
+                draw.line([p[0], p[1], hx, hy], fill=self.ROBOT_RGB, width=max(2, self._scale // 2))
+        if self._goal_xy is not None:
+            p = self._world_to_px(*self._goal_xy)
+            if p is not None:
+                r = max(4, self._scale)
+                draw.line([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=self.GOAL_RGB, width=2)
+                draw.line([p[0] - r, p[1] + r, p[0] + r, p[1] - r], fill=self.GOAL_RGB, width=2)
+        ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(img.width, img.height))
+        self._image_label.configure(image=ctk_img, text="")
+        self._image_label.image = ctk_img  # keep a reference, avoid GC
+
+    def _on_click(self, event) -> None:
+        if self._grid_info is None:
+            return
+        resolution, origin_x, origin_y, width, height = self._grid_info
+        col = event.x // self._scale
+        row = height - 1 - (event.y // self._scale)
+        if not (0 <= col < width and 0 <= row < height):
+            return
+        x = origin_x + (col + 0.5) * resolution
+        y = origin_y + (row + 0.5) * resolution
+        self._on_click_goal(x, y)
+
+
 class PawifyApp(ctk.CTk):
     def __init__(self, conn, args: argparse.Namespace) -> None:
         super().__init__()
@@ -344,6 +600,18 @@ class PawifyApp(ctk.CTk):
         self._talking = False
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="pawify_"))
 
+        # Navigate mode: closes the connection above, hands the robot's one
+        # WebRTC slot to a DimOS blueprint subprocess, and renders that
+        # blueprint's costmap/pose (read straight off its pub/sub bus — see
+        # NavMapView) inside this same window. See NAV_BLUEPRINT's comment.
+        self._nav_state = "idle"
+        self._nav_stop_requested = False
+        self._nav_got_costmap = False
+        self._nav_blueprint = NavigateBlueprint(
+            dimos_python=Path(sys.executable), dimos_dir=args.dimos_dir, blueprint=args.nav_blueprint,
+        )
+        self._ui_action_queue: queue.Queue = queue.Queue()
+
         ctk.set_appearance_mode("dark")
         self.title(APP_TITLE)
         self.geometry("1100x760")
@@ -358,6 +626,7 @@ class PawifyApp(ctk.CTk):
         self.after(33, self._video_tick)
         self.after(50, self._movement_tick)
         self.after(100, self._drain_log_queue)
+        self.after(100, self._drain_ui_actions)
 
     # ─── UI construction ────────────────────────────────────────────
 
@@ -384,13 +653,32 @@ class PawifyApp(ctk.CTk):
         view_frame = ctk.CTkFrame(self)
         view_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
 
-        self._video_label = ctk.CTkLabel(view_frame, text="waiting for camera...")
-        self._video_label.pack(padx=8, pady=(8, 4))
+        view_toggle_row = ctk.CTkFrame(view_frame, fg_color="transparent")
+        view_toggle_row.pack(fill="x", padx=8, pady=(8, 0))
+        self._camera_view_btn = ctk.CTkButton(
+            view_toggle_row, text="📷 Camera", width=110, command=lambda: self._show_view("camera")
+        )
+        self._camera_view_btn.pack(side="left", padx=(0, 6))
+        self._map_view_btn = ctk.CTkButton(
+            view_toggle_row, text="🗺 Map", width=110, fg_color="transparent", border_width=1,
+            command=lambda: self._show_view("map"),
+        )
+        self._map_view_btn.pack(side="left")
 
+        self._camera_view = ctk.CTkFrame(view_frame, fg_color="transparent")
+        self._video_label = ctk.CTkLabel(self._camera_view, text="waiting for camera...")
+        self._video_label.pack(padx=8, pady=(8, 4))
         self._obstacle_label = ctk.CTkLabel(
-            view_frame, text="obstacle: --", font=ctk.CTkFont(size=13, weight="bold")
+            self._camera_view, text="obstacle: --", font=ctk.CTkFont(size=13, weight="bold")
         )
         self._obstacle_label.pack(fill="x", padx=8, pady=(0, 8))
+
+        self._map_view = NavMapView(
+            view_frame, width=VIDEO_W, height=VIDEO_H, on_click_goal=self._on_map_click_goal
+        )
+
+        self._view_frame = view_frame
+        self._show_view("camera")
 
         # Sidebar
         sidebar = ctk.CTkScrollableFrame(self, label_text="Controls")
@@ -399,6 +687,7 @@ class PawifyApp(ctk.CTk):
         self._build_trick_panel(sidebar)
         self._build_ai_panel(sidebar)
         self._build_talk_panel(sidebar)
+        self._build_nav_panel(sidebar)
 
         # Log
         log_frame = ctk.CTkFrame(self)
@@ -474,6 +763,7 @@ class PawifyApp(ctk.CTk):
 
     def _build_movement_panel(self, parent) -> None:
         frame = ctk.CTkFrame(parent)
+        self._movement_frame = frame
         frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(frame, text="Movement (click & hold, or WASD/QE)", anchor="w").pack(
             fill="x", padx=8, pady=(8, 4)
@@ -518,6 +808,7 @@ class PawifyApp(ctk.CTk):
 
     def _build_trick_panel(self, parent) -> None:
         frame = ctk.CTkFrame(parent)
+        self._trick_frame = frame
         frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(frame, text="Tricks (safe poses only — no dances/flips)", anchor="w").pack(
             fill="x", padx=8, pady=(8, 4)
@@ -536,6 +827,7 @@ class PawifyApp(ctk.CTk):
 
     def _build_ai_panel(self, parent) -> None:
         frame = ctk.CTkFrame(parent)
+        self._ai_frame = frame
         frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(frame, text="AI Command (natural language)", anchor="w").pack(
             fill="x", padx=8, pady=(8, 4)
@@ -557,6 +849,7 @@ class PawifyApp(ctk.CTk):
 
     def _build_talk_panel(self, parent) -> None:
         frame = ctk.CTkFrame(parent)
+        self._talk_frame = frame
         frame.pack(fill="x", padx=6, pady=6)
         ctk.CTkLabel(
             frame, text="Talk to the person near the robot", anchor="w"
@@ -594,6 +887,36 @@ class PawifyApp(ctk.CTk):
         self._volume_slider.pack(side="left", fill="x", expand=True, padx=6)
         ctk.CTkLabel(volume_row, text="🔊").pack(side="left")
 
+    def _build_nav_panel(self, parent) -> None:
+        frame = ctk.CTkFrame(parent)
+        frame.pack(fill="x", padx=6, pady=6)
+        ctk.CTkLabel(frame, text="Map / Navigate (DimOS relocalization)", anchor="w").pack(
+            fill="x", padx=8, pady=(8, 4)
+        )
+        ctk.CTkLabel(
+            frame,
+            text="The Go2 only accepts one connection at a time, so this swaps the robot's "
+            "link over to DimOS's mapping/navigation stack. Camera, movement, tricks, and "
+            "talk here are unavailable until you exit Navigate mode.",
+            anchor="w", justify="left", font=ctk.CTkFont(size=11), text_color="#888888",
+            wraplength=260,
+        ).pack(fill="x", padx=8, pady=(0, 6))
+
+        self._map_file_entry = ctk.CTkEntry(frame, placeholder_text="premap name or path")
+        self._map_file_entry.insert(0, self._args.map_file)
+        self._map_file_entry.pack(fill="x", padx=8, pady=(0, 6))
+
+        self._nav_button = ctk.CTkButton(
+            frame, text="Enter Navigate Mode", fg_color="#16a085", hover_color="#117a65",
+            command=self._toggle_navigate_mode,
+        )
+        self._nav_button.pack(fill="x", padx=8, pady=(0, 4))
+
+        self._nav_status_label = ctk.CTkLabel(
+            frame, text="Navigate: idle", anchor="w", font=ctk.CTkFont(size=11), text_color="#888888"
+        )
+        self._nav_status_label.pack(fill="x", padx=8, pady=(0, 8))
+
     # ─── keyboard bindings (same held-key movement, driven by real key events) ───
 
     def _bind_keys(self) -> None:
@@ -609,18 +932,25 @@ class PawifyApp(ctk.CTk):
         self._speed_value_label.configure(text=f"{self._state.speed:.2f} m/s")
 
     def _movement_tick(self) -> None:
-        held_keys = {_MOVE_BUTTON_KEYS[n] for n in self._held if n in _MOVE_BUTTON_KEYS}
-        twist = dg2._twist_from_held(held_keys, self._state)
-        if twist is not None:
-            try:
-                self._conn.move(twist, duration=0)
-            except Exception as e:
-                self._log(f"Move failed: {e}")
+        if self._conn is not None:
+            held_keys = {_MOVE_BUTTON_KEYS[n] for n in self._held if n in _MOVE_BUTTON_KEYS}
+            twist = dg2._twist_from_held(held_keys, self._state)
+            if twist is not None:
+                try:
+                    self._conn.move(twist, duration=0)
+                except Exception as e:
+                    self._log(f"Move failed: {e}")
         self.after(50, self._movement_tick)
 
     def _emergency_stop(self) -> None:
         self._held.clear()
         self._state.cur_x = self._state.cur_y = self._state.cur_yaw = 0.0
+        # In Navigate mode self._conn is None (DimOS holds the robot's one
+        # WebRTC connection instead) — nothing for this button to stop here;
+        # exit Navigate mode or use DimOS's own stop path for that.
+        if self._conn is None:
+            self._log("STOP — no teleop connection right now (in Navigate mode?).")
+            return
         try:
             self._conn.stop_movement()
         except Exception as e:
@@ -673,7 +1003,7 @@ class PawifyApp(ctk.CTk):
 
     def _send_talk_clip(self, wav_path: Path) -> None:
         self._log("Talk: sending to robot speaker (upload + playback wait — can take up to ~40s)...")
-        if dg2._send_wav_via_megaphone(self._conn, wav_path, log=self._log):
+        if dg2._send_wav_to_robot(self._conn, wav_path, log=self._log):
             self._log("Talk: sent — robot should have broadcast it.")
 
     def _say_typed_message(self) -> None:
@@ -707,6 +1037,308 @@ class PawifyApp(ctk.CTk):
 
     def _on_volume_change(self, value: float) -> None:
         self._listener.volume = float(value)
+
+    # ─── navigate mode (DimOS relocalization + navigation, rendered here) ─
+
+    def _show_view(self, which: str) -> None:
+        active_color = ("#3a7ebf", "#1f538d")
+        for w in (self._camera_view, self._map_view):
+            w.pack_forget()
+        if which == "camera":
+            self._camera_view.pack(padx=8, pady=(4, 8))
+            self._camera_view_btn.configure(fg_color=active_color, border_width=0)
+            self._map_view_btn.configure(fg_color="transparent", border_width=1)
+        else:
+            self._map_view.pack(padx=8, pady=(4, 8), fill="both", expand=True)
+            self._map_view_btn.configure(fg_color=active_color, border_width=0)
+            self._camera_view_btn.configure(fg_color="transparent", border_width=1)
+
+    def _on_map_click_goal(self, x: float, y: float) -> None:
+        if self._nav_state != "active":
+            return
+        self._log(f"Navigate: sending goal x={x:.2f}m y={y:.2f}m...")
+        self._map_view.update_goal(x, y)
+        threading.Thread(target=lambda: self._send_nav_goal(x, y), daemon=True).start()
+
+    _NAV_BUTTON_STYLE = {
+        "idle": ("Enter Navigate Mode", "normal", "#16a085", "#117a65"),
+        "entering": ("Entering Navigate Mode...", "disabled", "#16a085", "#117a65"),
+        "active": ("Exit Navigate Mode", "normal", "#c0392b", "#922b21"),
+        "exiting": ("Exiting Navigate Mode...", "disabled", "#c0392b", "#922b21"),
+        "reconnecting": ("Reconnecting teleop...", "disabled", "#16a085", "#117a65"),
+        "reconnect_failed": ("Retry Reconnect", "normal", "#e67e22", "#ca6f1e"),
+    }
+    _NAV_STATUS_STYLE = {
+        "idle": ("Navigate: idle", "#888888"),
+        "entering": ("Navigate: closing teleop, launching DimOS...", "#f39c12"),
+        "active": ("Navigate: active — click the map to send a goal", "#2ecc71"),
+        "exiting": ("Navigate: stopping DimOS...", "#f39c12"),
+        "reconnecting": ("Navigate: reconnecting teleop...", "#f39c12"),
+        "reconnect_failed": ("Navigate: teleop reconnect failed — see log", "#e74c3c"),
+    }
+
+    def _apply_nav_state(self) -> None:
+        text, state, fg, hover = self._NAV_BUTTON_STYLE[self._nav_state]
+        self._nav_button.configure(text=text, state=state, fg_color=fg, hover_color=hover)
+        status_text, color = self._NAV_STATUS_STYLE[self._nav_state]
+        self._nav_status_label.configure(text=status_text, text_color=color)
+        self._set_live_controls_enabled(self._nav_state == "idle")
+
+    def _toggle_navigate_mode(self) -> None:
+        if self._nav_state == "idle":
+            self._enter_navigate_mode()
+        elif self._nav_state == "active":
+            self._exit_navigate_mode()
+        elif self._nav_state == "reconnect_failed":
+            self._begin_teleop_reconnect()
+
+    def _enter_navigate_mode(self) -> None:
+        if self._nav_state != "idle":
+            return
+        raw_map = self._map_file_entry.get().strip() or self._args.map_file
+        try:
+            map_path = dg2._resolve_map_file(raw_map, self._args.dimos_dir)
+        except FileNotFoundError as e:
+            self._log(f"Navigate: {e}")
+            return
+
+        self._nav_state = "entering"
+        self._nav_got_costmap = False
+        self._apply_nav_state()
+        self._show_view("map")
+        self._map_view.clear()
+        self._log(f"Navigate: switching the robot's connection to DimOS (map={map_path}).")
+
+        def work() -> None:
+            self._teardown_robot_session()
+            time.sleep(1.5)  # best-effort: give the robot a moment to release the connection
+            try:
+                self._nav_blueprint.start(
+                    map_file=map_path,
+                    is_ready=self._nav_data_ready,
+                    on_ready=lambda: self._post_to_ui(self._nav_became_active),
+                    on_exit=lambda code: self._post_to_ui(lambda: self._on_nav_exit(code)),
+                    log=self._log,
+                )
+                self._start_nav_subscriptions()
+            except Exception as e:
+                self._log(f"Navigate: failed to launch DimOS ({e}).")
+                self._nav_blueprint.stop(log=self._log)  # don't leak the subprocess/connection
+                self._post_to_ui(self._begin_teleop_reconnect)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _nav_became_active(self) -> None:
+        """Called (via _post_to_ui) once _nav_data_ready() first returns
+        True — i.e. real costmap/pose data is actually flowing, not just
+        "the process started"."""
+        if self._nav_state != "entering":
+            return
+        self._nav_state = "active"
+        self._apply_nav_state()
+
+    def _exit_navigate_mode(self) -> None:
+        if self._nav_state != "active":
+            return
+        self._nav_state = "exiting"
+        self._apply_nav_state()
+        self._nav_stop_requested = True
+        self._stop_nav_subscriptions()
+        threading.Thread(target=lambda: self._nav_blueprint.stop(log=self._log), daemon=True).start()
+
+    def _on_nav_exit(self, code) -> None:
+        was_requested = self._nav_stop_requested
+        self._nav_stop_requested = False
+        self._stop_nav_subscriptions()
+        if not was_requested:
+            self._log(
+                f"Navigate: DimOS blueprint exited unexpectedly (code={code}); reconnecting teleop."
+            )
+        self._begin_teleop_reconnect()
+
+    def _teardown_robot_session(self) -> None:
+        """Tears down everything holding the robot's one connection slot, so
+        the DimOS blueprint can claim it. Mirrors _on_close()'s robot-side
+        cleanup, minus destroying the window."""
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
+        try:
+            self._obstacle_radar.stop()
+        except Exception:
+            pass
+        try:
+            self._video.stop()
+        except Exception:
+            pass
+        if self._conn is not None:
+            try:
+                self._conn.stop_movement()
+                self._conn.stop()
+            except Exception as e:
+                self._log(f"Navigate: error closing teleop connection ({e}) — continuing anyway.")
+        self._conn = None
+
+    def _begin_teleop_reconnect(self) -> None:
+        self._nav_state = "reconnecting"
+        self._apply_nav_state()
+
+        def work() -> None:
+            try:
+                conn = dg2._connect(self._args)
+                dg2.prepare_locomotion(conn, self._args, log=self._log)
+            except Exception as e:
+                self._post_to_ui(lambda: self._finish_teleop_reconnect(None, e))
+                return
+            self._post_to_ui(lambda: self._finish_teleop_reconnect(conn, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_teleop_reconnect(self, conn, error: Exception | None) -> None:
+        if error is not None or conn is None:
+            self._log(
+                f"Navigate: failed to reconnect teleop ({error}). Fix the issue (robot "
+                "reachable? no other client still connected?) and click Retry Reconnect."
+            )
+            self._nav_state = "reconnect_failed"
+            self._apply_nav_state()
+            return
+        self._conn = conn
+        self._listener = RobotListener(conn, self._log)
+        self._video = VideoFeed(conn)
+        self._obstacle_radar = ObstacleRadar(conn)
+        self._video.start()
+        self._obstacle_radar.start()
+        self._log("Navigate: teleop reconnected.")
+        self._show_view("camera")
+        self._map_view.clear()
+        self._nav_state = "idle"
+        self._apply_nav_state()
+
+    _LIVE_CONTROL_WIDGET_TYPES = (ctk.CTkButton, ctk.CTkEntry, ctk.CTkSlider, ctk.CTkSwitch)
+
+    def _disableable_widgets(self, root) -> list:
+        found = []
+        for child in root.winfo_children():
+            if isinstance(child, self._LIVE_CONTROL_WIDGET_TYPES):
+                found.append(child)
+            found.extend(self._disableable_widgets(child))
+        return found
+
+    def _set_live_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        widgets = [self._paw_button]
+        for frame in (self._movement_frame, self._trick_frame, self._ai_frame, self._talk_frame):
+            widgets.extend(self._disableable_widgets(frame))
+        for w in widgets:
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+
+    def _post_to_ui(self, fn) -> None:
+        """Thread-safe: schedule fn to run on the Tk main thread. Same
+        reasoning as _log's docstring — calling .after() itself from a
+        background thread is NOT safe, so this only enqueues;
+        _drain_ui_actions (driven by the main thread's own .after() loop)
+        actually runs it."""
+        self._ui_action_queue.put(fn)
+
+    def _drain_ui_actions(self) -> None:
+        while True:
+            try:
+                fn = self._ui_action_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:
+                self._log(f"Navigate: internal UI error ({e}).")
+        self.after(100, self._drain_ui_actions)
+
+    # ─── navigate-mode bus subscriptions ──────────────────────────────
+    # Reads the running blueprint's costmap/pose straight off its pub/sub
+    # bus (plain LCM, same as `dimos topic echo/send`) and feeds NavMapView
+    # — no DimOS web UI involved. Topics/schema below are the blueprint's
+    # actual autoconnect wiring, not guesses:
+    #   /global_costmap (OccupancyGrid) — CostMapper's sole output, feeds
+    #     ReplanningAStarPlanner same as it would with or without
+    #     relocalization (relocalization changes the costmap's *content* by
+    #     also feeding CostMapper a merged_map, not which topic carries it).
+    #   /odom (PoseStamped) — published by GO2Connection, frame_id="world".
+    #   /target (PoseStamped) — a ReplanningAStarPlanner goal input that,
+    #     unlike /goal_request, isn't also written to by this blueprint's
+    #     own WavefrontFrontierExplorer/PatrollingModule modules, so our
+    #     clicks can't race an autonomous goal those publish.
+
+    def _nav_data_ready(self) -> bool:
+        """Polled by NavigateBlueprint's watcher thread (a BACKGROUND
+        thread — must stay Tk-free): True once at least one costmap message
+        has come off the bus."""
+        return self._nav_got_costmap
+
+    def _start_nav_subscriptions(self) -> None:
+        from dimos.core.transport import LCMTransport
+        from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+        from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
+
+        costmap_t = LCMTransport("/global_costmap", OccupancyGrid)
+        odom_t = LCMTransport("/odom", PoseStamped)
+        goal_t = LCMTransport("/target", PoseStamped)
+
+        def on_costmap(msg) -> None:
+            self._nav_got_costmap = True
+            info = msg.info
+            self._post_to_ui(
+                lambda: self._map_view.update_costmap(
+                    info.resolution, info.origin.position.x, info.origin.position.y,
+                    info.width, info.height, msg.grid,
+                )
+            )
+
+        def on_odom(msg) -> None:
+            yaw = _yaw_from_quaternion(msg.orientation)
+            self._post_to_ui(lambda: self._map_view.update_pose(msg.position.x, msg.position.y, yaw))
+
+        self._nav_unsub_costmap = costmap_t.subscribe(on_costmap)
+        self._nav_unsub_odom = odom_t.subscribe(on_odom)
+        goal_t.start()
+        self._nav_costmap_transport = costmap_t
+        self._nav_odom_transport = odom_t
+        self._nav_goal_transport = goal_t
+
+    def _stop_nav_subscriptions(self) -> None:
+        for unsub_attr in ("_nav_unsub_costmap", "_nav_unsub_odom"):
+            unsub = getattr(self, unsub_attr, None)
+            if unsub is not None:
+                try:
+                    unsub()
+                except Exception:
+                    pass
+                setattr(self, unsub_attr, None)
+        for transport_attr in ("_nav_costmap_transport", "_nav_odom_transport", "_nav_goal_transport"):
+            transport = getattr(self, transport_attr, None)
+            if transport is not None:
+                try:
+                    transport.stop()
+                except Exception:
+                    pass
+                setattr(self, transport_attr, None)
+
+    def _send_nav_goal(self, x: float, y: float) -> None:
+        from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+
+        transport = getattr(self, "_nav_goal_transport", None)
+        if transport is None:
+            self._log("Navigate: goal channel isn't open (not in Navigate mode?).")
+            return
+        goal = PoseStamped(position=(x, y, 0.0), orientation=(0.0, 0.0, 0.0, 1.0), frame_id="world")
+        try:
+            transport.publish(goal)
+            self._log(f"Navigate: goal sent (x={x:.2f}m, y={y:.2f}m, frame=world).")
+        except Exception as e:
+            self._log(f"Navigate: failed to send goal ({e}).")
 
     # ─── video ──────────────────────────────────────────────────────
 
@@ -779,17 +1411,36 @@ class PawifyApp(ctk.CTk):
             self._video.stop()
         except Exception:
             pass
-        try:
-            self._conn.stop_movement()
-            self._conn.stop()
-        except Exception:
-            pass
+        if self._nav_blueprint.running:
+            try:
+                self._stop_nav_subscriptions()
+                self._nav_blueprint.stop(log=self._log)
+            except Exception:
+                pass
+        if self._conn is not None:
+            try:
+                self._conn.stop_movement()
+                self._conn.stop()
+            except Exception:
+                pass
         self.destroy()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = dg2.build_parser()
     parser.description = "Pawify — Go2 rescue operator console (camera + controls + talk/listen)."
+    parser.add_argument(
+        "--map-file",
+        default="recording_go2",
+        help="Premap name/path for Navigate mode's DimOS relocalization blueprint "
+        "(resolved against cwd, --dimos-dir's parent, and --dimos-dir; '.pc2.lcm' is "
+        "appended if missing). Editable in the UI too. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "--nav-blueprint",
+        default=NAV_BLUEPRINT,
+        help="DimOS blueprint Navigate mode launches. Default: %(default)s.",
+    )
     return parser
 
 

@@ -137,6 +137,52 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+def _default_dimos_dir() -> Path:
+    """Best-guess dimos project root, checked at increasing distance from
+    this file. This project's scripts and its dimos checkout don't share a
+    parent directory consistently (dimos has ended up as a sibling of
+    dog_function/, of Pawify/, and of the repo root across different
+    checkouts here) — --dimos-dir still overrides this outright, this is
+    only the fallback when it's not passed."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "dimos", here.parent / "dimos", here.parent.parent / "dimos"):
+        if (candidate / "dimos" / "__init__.py").exists():
+            return candidate
+    return here / "dimos"  # unchanged from before: at least errors clearly via add_dimos_to_path
+
+
+NAV_MAP_SUFFIX = ".pc2.lcm"
+
+
+def _resolve_map_file(raw: str, dimos_dir: Path) -> Path:
+    """Resolve a premap name/path (e.g. "recording_go2") to an absolute,
+    existing `.pc2.lcm` file — independent of cwd, unlike dimos's own
+    resolve_named_path(). Checked, in order: cwd, this scripts directory
+    (dog_function/ — where the premap .db/.pc2.lcm/.rrd files have actually
+    lived at various points), --dimos-dir's parent, and --dimos-dir itself
+    — the premap's location relative to the dimos checkout hasn't stayed
+    put across setups here, so this casts a wide net rather than assuming
+    one fixed layout."""
+    here = Path(__file__).resolve().parent
+    given = Path(raw).expanduser()
+    stem = raw[: -len(NAV_MAP_SUFFIX)] if raw.endswith(NAV_MAP_SUFFIX) else raw
+
+    candidates: list[Path] = []
+    if given.is_absolute():
+        candidates.append(given)
+    else:
+        for base in (Path.cwd(), here, dimos_dir.parent, dimos_dir):
+            candidates.append(base / raw)
+            candidates.append(base / f"{stem}{NAV_MAP_SUFFIX}")
+
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(f"Could not find premap {raw!r}. Tried:\n  {tried}")
+
+
 def add_dimos_to_path(dimos_dir: Path) -> None:
     if dimos_dir.exists():
         sys.path.insert(0, str(dimos_dir))
@@ -443,8 +489,6 @@ def _audiohub_request(hub, api_id: int, parameter: dict | None = None):
 
 def _send_wav_via_megaphone(conn, wav_path, log=print) -> bool:
     """Broadcast a WAV file through the robot's speaker (megaphone mode).
-    Shared by voice push-to-talk and typed say() — both just need to get a
-    WAV onto the robot; only how the WAV was produced differs.
 
     Full audio channel lifecycle, each step logged and checked against the
     robot's real response rather than assumed:
@@ -459,8 +503,14 @@ def _send_wav_via_megaphone(conn, wav_path, log=print) -> bool:
       5. exit megaphone mode — in a `finally`, so a failure in steps 2-3
          can't leave the robot stuck in megaphone mode, which would
          silently break every subsequent send too.
-    Matches the timing dimos's own dimos/skills/unitree/unitree_speak.py
-    already uses successfully."""
+
+    NOTE: dimos's own dimos/skills/unitree/unitree_speak.py implements this
+    same megaphone flow but calls it "experimental" and defaults to the
+    upload+play flow instead (see _send_wav_via_upload_and_play below) — on
+    at least some robot/firmware combos, megaphone mode accepts every step
+    (enters, uploads, exits) without ever rejecting anything, yet nothing
+    is actually audible. _send_wav_to_robot() tries the verified upload+play
+    path first and only falls back to this one."""
     import asyncio
 
     from unitree_webrtc_connect.constants import AUDIO_API
@@ -516,10 +566,111 @@ def _send_wav_via_megaphone(conn, wav_path, log=print) -> bool:
     return ok
 
 
+def _send_wav_via_upload_and_play(conn, wav_path, log=print) -> bool:
+    """Broadcast a WAV file by uploading it as a named clip (UPLOAD_AUDIO_FILE)
+    and then playing it back by UUID (SELECT_START_PLAY) — the non-megaphone
+    path dimos's own unitree_speak.py uses by default (megaphone mode there
+    is opt-in and labeled "experimental"). Slower than megaphone (an extra
+    round trip to list the file before playback can start) but is the more
+    thoroughly-verified path, so it's tried first by _send_wav_to_robot()."""
+    import asyncio
+    import base64
+    import hashlib
+
+    from unitree_webrtc_connect.constants import AUDIO_API
+    from unitree_webrtc_connect.webrtc_audiohub import WebRTCAudioHub
+
+    norm_path, duration = _normalize_wav_for_robot(wav_path, log=log)
+    log(f"  -> audio ready: {duration:.1f}s, {ROBOT_AUDIO_SAMPLE_RATE}Hz mono 16-bit PCM.")
+
+    try:
+        hub = WebRTCAudioHub(conn.conn)
+    except Exception as e:
+        log(f"  -> could not open the robot's audio data channel: {e}")
+        if norm_path != Path(wav_path):
+            norm_path.unlink(missing_ok=True)
+        return False
+
+    audio_data = Path(norm_path).read_bytes()
+    file_md5 = hashlib.md5(audio_data).hexdigest()
+    b64_data = base64.b64encode(audio_data).decode("utf-8")
+    chunk_size = 61440  # matches unitree_speak.py's verified upload chunking
+    chunks = [b64_data[i : i + chunk_size] for i in range(0, len(b64_data), chunk_size)]
+    total_chunks = len(chunks)
+    filename = f"pawify_{int(time.time() * 1000)}"
+
+    async def _run() -> bool:
+        for i, chunk in enumerate(chunks, 1):
+            parameter = {
+                "file_name": filename,
+                "file_type": "wav",
+                "file_size": len(audio_data),
+                "current_block_index": i,
+                "total_block_number": total_chunks,
+                "block_content": chunk,
+                "current_block_size": len(chunk),
+                "file_md5": file_md5,
+                "create_time": int(time.time() * 1000),
+            }
+            resp = await _audiohub_request(hub, AUDIO_API["UPLOAD_AUDIO_FILE"], parameter)
+            code = _extract_response_code(resp)
+            if code not in (None, 0):
+                log(f"  -> robot REJECTED audio chunk {i}/{total_chunks} (code {code}).")
+                return False
+            await asyncio.sleep(0.02)
+
+        # Uploads land as a named clip, not a direct handle — look its UUID
+        # up by the filename we just uploaded before we can play it.
+        unique_id = filename
+        try:
+            list_resp = await _audiohub_request(hub, AUDIO_API["GET_AUDIO_LIST"])
+            data = list_resp.get("data", {}) if isinstance(list_resp, dict) else {}
+            payload = json.loads(data.get("data", "{}"))
+            for audio in payload.get("audio_list", []):
+                if audio.get("CUSTOM_NAME") == filename:
+                    unique_id = audio.get("UNIQUE_ID", filename)
+                    break
+        except Exception as e:
+            log(f"  -> could not look up uploaded clip's UUID ({e}); trying filename directly.")
+
+        resp = await _audiohub_request(hub, AUDIO_API["SELECT_START_PLAY"], {"unique_id": unique_id})
+        code = _extract_response_code(resp)
+        if code not in (None, 0):
+            log(f"  -> robot REJECTED playback (code {code}).")
+            return False
+        await asyncio.sleep(duration + 0.5)
+        return True
+
+    ok = False
+    try:
+        ok = asyncio.run_coroutine_threadsafe(_run(), conn.loop).result(timeout=60 + duration)
+    except Exception as e:
+        log(f"  -> failed to send audio: {e}")
+    finally:
+        if norm_path != Path(wav_path):
+            norm_path.unlink(missing_ok=True)
+
+    return ok
+
+
+def _send_wav_to_robot(conn, wav_path, log=print) -> bool:
+    """Broadcast a WAV file through the robot's speaker. Shared by voice
+    push-to-talk and typed say() — both just need to get a WAV onto the
+    robot; only how the WAV was produced differs.
+
+    Tries the upload+play path first (dimos's own verified default), and
+    falls back to megaphone mode only if that path is rejected outright —
+    covers robots/firmware where one of the two doesn't work."""
+    if _send_wav_via_upload_and_play(conn, wav_path, log=log):
+        return True
+    log("  -> upload+play didn't go through, falling back to megaphone mode...")
+    return _send_wav_via_megaphone(conn, wav_path, log=log)
+
+
 def _speak_text(conn, text: str, log=print) -> None:
     """Synthesize `text` offline (pyttsx3 — no network/API key needed, since
     the robot's own hotspot likely has no internet route) and broadcast it
-    through the robot's speaker via megaphone mode."""
+    through the robot's speaker."""
     text = text.strip()
     if not text:
         return
@@ -548,7 +699,7 @@ def _speak_text(conn, text: str, log=print) -> None:
 
     try:
         log("  -> sending to robot speaker (upload + playback wait — can take a while)...")
-        if _send_wav_via_megaphone(conn, tmp_path, log=log):
+        if _send_wav_to_robot(conn, tmp_path, log=log):
             log("  -> sent.")
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -1024,9 +1175,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Direct Go2 movement, and live keyboard/command control, over Unitree WebRTC."
     )
-    parser.add_argument(
-        "--dimos-dir", type=Path, default=Path(__file__).resolve().parent / "dimos"
-    )
+    parser.add_argument("--dimos-dir", type=Path, default=_default_dimos_dir())
     parser.add_argument("--ip", default=None)
     parser.add_argument("--aes-key", default=None)
     parser.add_argument(
