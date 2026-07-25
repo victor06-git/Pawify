@@ -54,3 +54,4 @@ if __name__ == "__main__":
 
     print("\n--- Fetching GPS Coordinates ---")
     gps_coordinates = fetch_nearest_gps()
+    print(gps_coordinates)

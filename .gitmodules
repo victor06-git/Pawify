@@ -1,0 +1,3 @@
+[submodule "pawify"]
+	path = pawify
+	url = https://github.com/itsleatch/pawify.git

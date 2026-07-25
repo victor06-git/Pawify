@@ -221,6 +221,11 @@ class SendGoalApp(ctk.CTk):
             entry_row, text="⏹ Cancel Navigation", fg_color="#c0392b", hover_color="#922b21",
             command=self._cancel_navigation,
         ).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(
+            entry_row, text="📍", width=32, height=32, corner_radius=16,
+            fg_color="#2980b9", hover_color="#1f618d",
+            command=self._fetch_nearest_gps,
+        ).pack(side="left", padx=(10, 0))
 
         self._log_box = ctk.CTkTextbox(self, height=140, state="disabled")
         self._log_box.pack(fill="x", padx=10, pady=(0, 10))
@@ -308,6 +313,39 @@ class SendGoalApp(ctk.CTk):
             self._log("Enter numeric x and y (meters) before sending.")
             return
         self._send_goal(x, y)
+
+    def _fetch_nearest_gps(self) -> None:
+        self._log("Fetching nearest GPS position...")
+        threading.Thread(target=self._fetch_nearest_gps_worker, daemon=True).start()
+
+    def _fetch_nearest_gps_worker(self) -> None:
+        from robot_api import fetch_nearest_gps
+
+        try:
+            gps_data = fetch_nearest_gps()
+        except Exception as e:
+            self._log(f"Failed to fetch nearest GPS ({e}).")
+            return
+        if not gps_data:
+            self._log("Nearest GPS returned no data.")
+            return
+        x, y = gps_data.get("x"), gps_data.get("y")
+        if x is None or y is None:
+            self._log(f"Nearest GPS response missing x/y: {gps_data}")
+            return
+        self._post_to_ui(lambda: self._select_gps_position(float(x), float(y)))
+
+    def _select_gps_position(self, x: float, y: float) -> None:
+        """Marks the fetched GPS position on the map and fills the x/y entries
+        without publishing it — same "select, then confirm" flow as typing
+        coordinates by hand, so a stale/bad GPS fix can't move the robot
+        without the operator hitting Send Goal."""
+        self._map_view.update_goal(x, y)
+        self._x_entry.delete(0, "end")
+        self._x_entry.insert(0, f"{x:.2f}")
+        self._y_entry.delete(0, "end")
+        self._y_entry.insert(0, f"{y:.2f}")
+        self._log(f"Nearest GPS position selected: x={x:.2f}m y={y:.2f}m — press Send Goal to confirm.")
 
     def _cancel_navigation(self) -> None:
         from dimos.msgs.std_msgs.Bool import Bool
