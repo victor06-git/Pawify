@@ -247,7 +247,6 @@ python demo_gesture.py --address <MAC> --go2-direct-on-sos --go2-ip <ROBOT_IP> -
 WebRTC move — see `--dimos-cmd`/`--dimos-dir`).
 
 
-> 📸 *Screenshot — `demo.apk` companion app:* `![ring companion app](images/ring_apk.png)`
 
 ## PRERREQUISITES
 
