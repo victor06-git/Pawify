@@ -1,1 +1,38 @@
+# DOG
 
+## FUNCTIONS
+
+## EXECUTION
+
+### Pawify app
+
+- /Pawify/dog_function main
+dimos ❯ dimos run unitree-go2-relocalization \
+              -o relocalizationmodule.map_file=recording_go2
+
+### Map sender position / Interactive map
+
+- create a './send_goal.sh' & put inside:
+    #!/usr/bin/env bash
+    exec dimos/.venv/bin/python \
+        /Pawify/dog_function/send_goal.py "$@"
+
+- Execution: ./send_goal.sh
+
+### DimOs app (to get the info from the robot to the interactive map)
+
+- /Pawify/dog_function main
+dimos ❯ dimos run unitree-go2-relocalization \
+              -o relocalizationmodule.map_file=recording_go2  # recording_go2 it's the database name of the scanned map
+
+## PRERREQUISTES
+
+Install dimOS from https://github.com/dimensionalOS/dimos
+
+Install at least python 3.12, current python 3.12.13
+
+Have the Apache 2.0 license
+
+
+
+# RING
